@@ -1,0 +1,79 @@
+name: TDS GA7 Release Gate
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: TDS identity: 24f2007878@ds.study.iitm.ac.in
+        run: echo "TDS identity verified"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Test release-gate
+        run: |
+          python - <<'PY'
+          from app import app
+
+          client = app.test_client()
+
+          payload = {
+              "target": "production",
+              "event": "push",
+              "ref": "refs/heads/main",
+              "workflow": {
+                  "trigger": "push",
+                  "permissions": {
+                      "contents": "read",
+                      "packages": "write",
+                      "id-token": "none"
+                  },
+                  "testsPassed": True,
+                  "matrixComplete": True,
+                  "failFast": False,
+                  "environmentApproval": True,
+                  "actions": [
+                      {
+                          "owner": "actions",
+                          "name": "checkout",
+                          "ref": "v4"
+                      }
+                  ]
+              },
+              "image": {
+                  "multiStage": True,
+                  "runsAsRoot": False,
+                  "secretMode": "none",
+                  "criticalVulnerabilities": 0,
+                  "digestPinned": True
+              }
+          }
+
+          response = client.post("/release-gate", json=payload)
+          result = response.get_json()
+
+          assert response.status_code == 200
+          assert result == {
+              "decision": "promote",
+              "violations": []
+          }
+
+          print("release-gate test passed")
+          PY
