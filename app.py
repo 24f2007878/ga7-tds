@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 
 # ============================================================
-# QUESTION 1 — /release-gate
+# Q1 — RELEASE GATE
 # ============================================================
 
 EXPECTED_PERMISSIONS = {
@@ -24,55 +24,57 @@ SHA40 = re.compile(r"^[0-9a-f]{40}$")
 def release_gate():
     body = request.get_json(silent=True)
 
-    violations = []
-
     if not isinstance(body, dict):
         return jsonify({
             "decision": "block",
-            "violations": [
-                "EXCESS_PERMISSION",
-                "UNSAFE_PR_TRIGGER",
-                "TESTS_INCOMPLETE",
-                "SINGLE_STAGE_IMAGE",
-                "ROOT_RUNTIME",
-                "SECRET_IN_LAYER",
-                "CRITICAL_CVE",
-                "UNPINNED_IMAGE"
-            ]
+            "violations": ["EXCESS_PERMISSION"]
         })
 
-    workflow = body.get("workflow", {})
-    image = body.get("image", {})
+    workflow = body.get("workflow")
+    image = body.get("image")
 
-    # Permissions
+    if not isinstance(workflow, dict):
+        workflow = {}
+
+    if not isinstance(image, dict):
+        image = {}
+
+    violations = []
+
+    # Exact permissions
     if workflow.get("permissions") != EXPECTED_PERMISSIONS:
         violations.append("EXCESS_PERMISSION")
 
-    # PR requirements
+    # Pull request trigger
     if body.get("event") == "pull_request":
         if workflow.get("trigger") != "pull_request":
             violations.append("UNSAFE_PR_TRIGGER")
 
-        if (
-            workflow.get("testsPassed") is not True
-            or workflow.get("matrixComplete") is not True
-            or workflow.get("failFast") is not False
-        ):
-            violations.append("TESTS_INCOMPLETE")
+    # Tests / matrix / failFast
+    if (
+        workflow.get("testsPassed") is not True
+        or workflow.get("matrixComplete") is not True
+        or workflow.get("failFast") is not False
+    ):
+        violations.append("TESTS_INCOMPLETE")
 
     # Actions
-    for action in workflow.get("actions", []):
-        if not isinstance(action, dict):
-            violations.append("MUTABLE_ACTION")
-            continue
+    actions = workflow.get("actions", [])
+    if isinstance(actions, list):
+        for action in actions:
+            if not isinstance(action, dict):
+                violations.append("MUTABLE_ACTION")
+                continue
 
-        if action.get("owner") == "actions":
-            continue
+            owner = action.get("owner")
+            ref = action.get("ref")
 
-        ref = action.get("ref")
+            if owner == "actions":
+                # Version tags are permitted for actions-owned actions.
+                continue
 
-        if not isinstance(ref, str) or SHA40.fullmatch(ref) is None:
-            violations.append("MUTABLE_ACTION")
+            if not isinstance(ref, str) or not SHA40.fullmatch(ref):
+                violations.append("MUTABLE_ACTION")
 
     # Image
     if image.get("multiStage") is not True:
@@ -81,7 +83,7 @@ def release_gate():
     if image.get("runsAsRoot") is not False:
         violations.append("ROOT_RUNTIME")
 
-    if image.get("secretMode") not in ("none", "buildkit"):
+    if image.get("secretMode") not in {"none", "buildkit"}:
         violations.append("SECRET_IN_LAYER")
 
     if image.get("criticalVulnerabilities") != 0:
@@ -108,7 +110,7 @@ def release_gate():
 
 
 # ============================================================
-# QUESTION 2 — /action-firewall
+# Q2 — ACTION FIREWALL
 # ============================================================
 
 TENANT = "tenant-36k4fs9"
@@ -118,33 +120,15 @@ ALLOWED_TOOLS = {
     "search",
     "lookup_record",
     "send_email",
-    "render_html"
+    "render_html",
 }
 
 
-def html_is_unsafe(value):
-    if re.search(
-        r"<\s*(script|iframe|object|embed)\b",
-        value,
-        re.I
-    ):
-        return True
-
-    if re.search(
-        r"\bon[a-zA-Z0-9_-]+\s*=",
-        value,
-        re.I
-    ):
-        return True
-
-    if re.search(
-        r"javascript\s*:|vbscript\s*:|data\s*:",
-        value,
-        re.I
-    ):
-        return True
-
-    return False
+def action_result(decision, reason):
+    return jsonify({
+        "decision": decision,
+        "reason": reason
+    })
 
 
 @app.post("/action-firewall")
@@ -153,150 +137,121 @@ def action_firewall():
 
     # 1. Top-level schema
     if not isinstance(body, dict):
-        return jsonify({
-            "decision": "block",
-            "reason": "INVALID_SCHEMA"
-        })
+        return action_result("block", "INVALID_SCHEMA")
 
     if body.get("provenance") not in {"trusted", "untrusted"}:
-        return jsonify({
-            "decision": "block",
-            "reason": "INVALID_SCHEMA"
-        })
+        return action_result("block", "INVALID_SCHEMA")
 
     if not isinstance(body.get("humanApproved"), bool):
-        return jsonify({
-            "decision": "block",
-            "reason": "INVALID_SCHEMA"
-        })
+        return action_result("block", "INVALID_SCHEMA")
 
     if "untrustedContent" in body and not isinstance(
         body["untrustedContent"], str
     ):
-        return jsonify({
-            "decision": "block",
-            "reason": "INVALID_SCHEMA"
-        })
+        return action_result("block", "INVALID_SCHEMA")
 
     action = body.get("action")
 
-    if (
-        not isinstance(action, dict)
-        or set(action.keys()) != {"tool", "args"}
-        or not isinstance(action.get("tool"), str)
-        or not isinstance(action.get("args"), dict)
-    ):
-        return jsonify({
-            "decision": "block",
-            "reason": "INVALID_SCHEMA"
-        })
+    if not isinstance(action, dict):
+        return action_result("block", "INVALID_SCHEMA")
+
+    if "tool" not in action or "args" not in action:
+        return action_result("block", "INVALID_SCHEMA")
+
+    if not isinstance(action["tool"], str):
+        return action_result("block", "INVALID_SCHEMA")
+
+    if not isinstance(action["args"], dict):
+        return action_result("block", "INVALID_SCHEMA")
 
     tool = action["tool"]
     args = action["args"]
 
     # 2. Tool allowlist
     if tool not in ALLOWED_TOOLS:
-        return jsonify({
-            "decision": "block",
-            "reason": "TOOL_NOT_ALLOWED"
-        })
+        return action_result("block", "TOOL_NOT_ALLOWED")
 
-    # 3. Tool argument schemas
-
+    # 3. Tool argument schema
     if tool == "search":
         if (
             set(args.keys()) != {"query"}
             or not isinstance(args["query"], str)
             or not 1 <= len(args["query"]) <= 200
         ):
-            return jsonify({
-                "decision": "block",
-                "reason": "INVALID_SCHEMA"
-            })
+            return action_result("block", "INVALID_SCHEMA")
 
     elif tool == "lookup_record":
         if set(args.keys()) != {"tenantId", "recordId"}:
-            return jsonify({
-                "decision": "block",
-                "reason": "INVALID_SCHEMA"
-            })
+            return action_result("block", "INVALID_SCHEMA")
 
         if (
             not isinstance(args["tenantId"], str)
             or not isinstance(args["recordId"], str)
             or args["recordId"] == ""
         ):
-            return jsonify({
-                "decision": "block",
-                "reason": "INVALID_SCHEMA"
-            })
+            return action_result("block", "INVALID_SCHEMA")
 
-        # 4. Tenant scope
+        # Tenant scope
         if args["tenantId"] != TENANT:
-            return jsonify({
-                "decision": "block",
-                "reason": "TENANT_SCOPE"
-            })
+            return action_result("block", "TENANT_SCOPE")
 
     elif tool == "send_email":
-        if (
-            set(args.keys()) != {"to", "subject", "body"}
-            or not isinstance(args["to"], str)
-            or not isinstance(args["subject"], str)
-            or not isinstance(args["body"], str)
-        ):
-            return jsonify({
-                "decision": "block",
-                "reason": "INVALID_SCHEMA"
-            })
+        if set(args.keys()) != {"to", "subject", "body"}:
+            return action_result("block", "INVALID_SCHEMA")
 
-        # 5. Egress
+        if not all(
+            isinstance(args[k], str)
+            for k in ("to", "subject", "body")
+        ):
+            return action_result("block", "INVALID_SCHEMA")
+
+        # Exact recipient domain.
         if "@" not in args["to"]:
-            return jsonify({
-                "decision": "block",
-                "reason": "EGRESS_DENIED"
-            })
+            return action_result("block", "EGRESS_DENIED")
 
         domain = args["to"].rsplit("@", 1)[1]
 
         if domain != EMAIL_DOMAIN:
-            return jsonify({
-                "decision": "block",
-                "reason": "EGRESS_DENIED"
-            })
+            return action_result("block", "EGRESS_DENIED")
 
-        # 6. Approval
         if body["humanApproved"] is not True:
-            return jsonify({
-                "decision": "block",
-                "reason": "APPROVAL_REQUIRED"
-            })
+            return action_result("block", "APPROVAL_REQUIRED")
 
     elif tool == "render_html":
-        if (
-            set(args.keys()) != {"html"}
-            or not isinstance(args["html"], str)
+        if set(args.keys()) != {"html"}:
+            return action_result("block", "INVALID_SCHEMA")
+
+        if not isinstance(args["html"], str):
+            return action_result("block", "INVALID_SCHEMA")
+
+        html = args["html"]
+
+        if re.search(
+            r"<\s*(script|iframe|object|embed)\b",
+            html,
+            re.I
         ):
-            return jsonify({
-                "decision": "block",
-                "reason": "INVALID_SCHEMA"
-            })
+            return action_result("block", "UNSAFE_OUTPUT")
 
-        # 7. HTML safety
-        if html_is_unsafe(args["html"]):
-            return jsonify({
-                "decision": "block",
-                "reason": "UNSAFE_OUTPUT"
-            })
+        if re.search(
+            r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
+            html,
+            re.I
+        ):
+            return action_result("block", "UNSAFE_OUTPUT")
 
-    return jsonify({
-        "decision": "allow",
-        "reason": "ALLOW"
-    })
+        if re.search(
+            r"javascript\s*:|vbscript\s*:|data\s*:",
+            html,
+            re.I
+        ):
+            return action_result("block", "UNSAFE_OUTPUT")
+
+    return action_result("allow", "ALLOW")
 
 
 # ============================================================
-# QUESTION 3 — /terraform/plan
+# Q3 — TERRAFORM PLAN
 # ============================================================
 
 TF_ENVIRONMENT = "prod-4tx5cu"
@@ -304,20 +259,20 @@ TF_ENVIRONMENT = "prod-4tx5cu"
 REQUIRED_LABELS = {
     "owner": "student-b2diq",
     "environment": "production",
-    "cost_center": "cc-0zts"
+    "cost_center": "cc-0zts",
 }
 
 VALID_BACKENDS = {
     "gcs",
     "s3",
     "azurerm",
-    "remote"
+    "remote",
 }
 
 DESTRUCTIVE_TYPES = {
     "storage_bucket",
     "sql_database",
-    "persistent_disk"
+    "persistent_disk",
 }
 
 
@@ -325,34 +280,38 @@ DESTRUCTIVE_TYPES = {
 def terraform_plan():
     body = request.get_json(silent=True)
 
-    # 1. Basic schema
+    # 1. Request/nested object types
     if not isinstance(body, dict):
         return jsonify({
             "decision": "reject",
             "reason": "INVALID_PLAN"
         })
 
-    required = {
-        "environment",
-        "state",
-        "providerVersion",
-        "destroyApproved",
-        "resource"
-    }
-
-    if set(body.keys()) != required:
+    if not isinstance(body.get("environment"), str):
         return jsonify({
             "decision": "reject",
             "reason": "INVALID_PLAN"
         })
 
-    if (
-        not isinstance(body["environment"], str)
-        or not isinstance(body["state"], dict)
-        or not isinstance(body["providerVersion"], str)
-        or not isinstance(body["destroyApproved"], bool)
-        or not isinstance(body["resource"], dict)
-    ):
+    if not isinstance(body.get("state"), dict):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(body.get("providerVersion"), str):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(body.get("destroyApproved"), bool):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(body.get("resource"), dict):
         return jsonify({
             "decision": "reject",
             "reason": "INVALID_PLAN"
@@ -360,11 +319,13 @@ def terraform_plan():
 
     state = body["state"]
 
-    if (
-        set(state.keys()) != {"backend", "locked"}
-        or not isinstance(state["backend"], str)
-        or not isinstance(state["locked"], bool)
-    ):
+    if not isinstance(state.get("backend"), str):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(state.get("locked"), bool):
         return jsonify({
             "decision": "reject",
             "reason": "INVALID_PLAN"
@@ -372,32 +333,39 @@ def terraform_plan():
 
     resource = body["resource"]
 
-    required_resource = {
-        "address",
-        "type",
-        "action",
-        "labels",
-        "secret",
-        "forceDestroy"
-    }
-
-    if set(resource.keys()) != required_resource:
+    if not isinstance(resource.get("address"), str):
         return jsonify({
             "decision": "reject",
             "reason": "INVALID_PLAN"
         })
 
-    if (
-        not isinstance(resource["address"], str)
-        or not isinstance(resource["type"], str)
-        or resource["action"] not in {"create", "update", "delete"}
-        or not isinstance(resource["labels"], dict)
-        or not isinstance(resource["forceDestroy"], bool)
-        or (
-            resource["secret"] is not None
-            and not isinstance(resource["secret"], str)
-        )
+    if not isinstance(resource.get("type"), str):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if resource.get("action") not in {"create", "update", "delete"}:
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(resource.get("labels"), dict):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if resource.get("secret") is not None and not isinstance(
+        resource.get("secret"), str
     ):
+        return jsonify({
+            "decision": "reject",
+            "reason": "INVALID_PLAN"
+        })
+
+    if not isinstance(resource.get("forceDestroy"), bool):
         return jsonify({
             "decision": "reject",
             "reason": "INVALID_PLAN"
@@ -420,11 +388,11 @@ def terraform_plan():
             "reason": "STATE_UNSAFE"
         })
 
-    # 4. Provider pinning
+    # 4. Provider
     if body["providerVersion"] not in {
         "6.2.1",
         "= 6.2.1",
-        "~> 6.0"
+        "~> 6.0",
     }:
         return jsonify({
             "decision": "reject",
@@ -432,8 +400,10 @@ def terraform_plan():
         })
 
     # 5. Labels
-    for key, expected in REQUIRED_LABELS.items():
-        if resource["labels"].get(key) != expected:
+    labels = resource["labels"]
+
+    for key, value in REQUIRED_LABELS.items():
+        if labels.get(key) != value:
             return jsonify({
                 "decision": "reject",
                 "reason": "MISSING_LABELS"
@@ -443,16 +413,16 @@ def terraform_plan():
     secret = resource["secret"]
 
     if secret is not None:
-        if not (
-            secret.startswith("secret://")
-            and len(secret) > len("secret://")
+        if (
+            not secret.startswith("secret://")
+            or len(secret) == len("secret://")
         ):
             return jsonify({
                 "decision": "reject",
                 "reason": "PLAINTEXT_SECRET"
             })
 
-    # 7. Destructive delete
+    # 7. Delete approval
     if (
         resource["action"] == "delete"
         and resource["type"] in DESTRUCTIVE_TYPES
@@ -463,7 +433,7 @@ def terraform_plan():
             "reason": "DELETE_NOT_APPROVED"
         })
 
-    # 8. Production bucket forceDestroy
+    # 8. Force destroy
     if (
         resource["type"] == "storage_bucket"
         and resource["forceDestroy"] is True
@@ -480,154 +450,202 @@ def terraform_plan():
 
 
 # ============================================================
-# QUESTION 4 — /sanitize-output
+# Q4 — SANITIZE OUTPUT
 # ============================================================
 
 ALLOWED_HOSTS = {
     "cdn-azl25lo.example",
-    "app-aoe5bkg.example"
+    "app-aoe5bkg.example",
 }
 
 
 def decode_once(value):
-    # Percent escapes
-    result = unquote(value)
+    # Percent decode once.
+    s = unquote(value)
 
-    # Requested HTML entities
-    result = re.sub(
+    # Decode exactly the specified HTML entities.
+    entity_map = {
+        "&lt;": "<",
+        "&gt;": ">",
+        "&quot;": '"',
+        "&apos;": "'",
+        "&amp;": "&",
+    }
+
+    def entity_replace(match):
+        token = match.group(0)
+
+        low = token.lower()
+
+        if low in entity_map:
+            return entity_map[low]
+
+        if low.startswith("&#x"):
+            try:
+                return chr(int(token[3:-1], 16))
+            except ValueError:
+                return token
+
+        if low.startswith("&#"):
+            try:
+                return chr(int(token[2:-1], 10))
+            except ValueError:
+                return token
+
+        return token
+
+    s = re.sub(
         r"&(?:lt|gt|quot|apos|amp);|&#[0-9]+;|&#x[0-9a-fA-F]+;",
-        lambda m: (
-            unescape(m.group(0))
-            if not m.group(0).lower().startswith("&#")
-            else (
-                chr(int(m.group(0)[2:-1]))
-                if m.group(0).lower().startswith("&#x") is False
-                else chr(int(m.group(0)[3:-1], 16))
-            )
-        ),
-        result,
-        flags=re.I
+        entity_replace,
+        s,
+        flags=re.I,
     )
 
-    # \uXXXX
-    result = re.sub(
+    # Decode \uXXXX once.
+    s = re.sub(
         r"\\u([0-9a-fA-F]{4})",
         lambda m: chr(int(m.group(1), 16)),
-        result
+        s,
     )
 
-    return result
+    return s
 
 
-def extract_html_urls(value):
+def extract_html_urls(text):
     return [
         m.group(2)
         for m in re.finditer(
             r"""\b(?:src|href)\s*=\s*(["'])(.*?)\1""",
-            value,
-            re.I | re.S
+            text,
+            re.I | re.S,
         )
     ]
 
 
-def extract_markdown_urls(value):
-    return [
-        m.group(1)
-        for m in re.finditer(
-            r"\]\(\s*<?([^>\s)]+)>?",
-            value
-        )
-    ]
+def extract_markdown_urls(text):
+    results = []
+
+    for m in re.finditer(r"\]\(\s*([^)]+?)\s*\)", text):
+        target = m.group(1).strip()
+
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1]
+
+        # Markdown destination may contain an optional title.
+        # The URL is the first token unless enclosed in <...>.
+        if not target.startswith("<"):
+            target = target.split(None, 1)[0]
+
+        results.append(target)
+
+    return results
 
 
-def dangerous_scheme(value, urls):
+def has_dangerous_scheme(text, urls):
+    # Explicit dangerous schemes anywhere in the text.
     if re.search(
         r"(?:javascript|data|vbscript)\s*:",
-        value,
-        re.I
+        text,
+        re.I,
     ):
         return True
 
     for url in urls:
-        candidate = "https:" + url if url.startswith("//") else url
-        scheme = urlparse(candidate).scheme.lower()
+        candidate = (
+            "https:" + url
+            if url.startswith("//")
+            else url
+        )
 
-        if scheme and scheme not in {"http", "https"}:
+        parsed = urlparse(candidate)
+
+        if parsed.scheme and parsed.scheme.lower() not in {
+            "http",
+            "https",
+        }:
             return True
 
     return False
 
 
-def external_exfil(urls):
+def has_external_exfil(urls):
     for url in urls:
-        # Relative URL
+        url = url.strip()
+
+        # Relative references are allowed.
         if url.startswith("/") and not url.startswith("//"):
             continue
 
-        candidate = "https:" + url if url.startswith("//") else url
+        # Protocol-relative is absolute and resolved as HTTPS.
+        candidate = (
+            "https:" + url
+            if url.startswith("//")
+            else url
+        )
+
         parsed = urlparse(candidate)
 
-        if parsed.scheme in {"http", "https"}:
+        if parsed.scheme.lower() in {"http", "https"}:
             if parsed.hostname not in ALLOWED_HOSTS:
                 return True
 
     return False
 
 
-def sanitize_decoded(channel, output):
+def output_rule(channel, output):
     if channel == "html":
         if re.search(
             r"<\s*(script|iframe|object|embed)\b",
             output,
-            re.I
+            re.I,
         ):
             return "SCRIPT_TAG"
 
         if re.search(
-            r"\bon[a-zA-Z0-9_-]+\s*=",
+            r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
             output,
-            re.I
+            re.I,
         ):
             return "EVENT_HANDLER"
 
         urls = extract_html_urls(output)
 
-        if dangerous_scheme(output, urls):
+        if has_dangerous_scheme(output, urls):
             return "DANGEROUS_SCHEME"
 
-        if external_exfil(urls):
+        if has_external_exfil(urls):
             return "EXTERNAL_EXFIL"
 
     elif channel == "markdown":
         urls = extract_markdown_urls(output)
 
-        if dangerous_scheme(output, urls):
+        if has_dangerous_scheme(output, urls):
             return "DANGEROUS_SCHEME"
 
-        if external_exfil(urls):
+        if has_external_exfil(urls):
             return "EXTERNAL_EXFIL"
 
     elif channel == "url":
         urls = [output.strip()]
 
-        if dangerous_scheme(output, urls):
+        if has_dangerous_scheme(output, urls):
             return "DANGEROUS_SCHEME"
 
-        if external_exfil(urls):
+        if has_external_exfil(urls):
             return "EXTERNAL_EXFIL"
 
     elif channel == "sql":
         if re.search(
             r"""['";]|--|/\*|\bunion\b|\bor\s+1=1\b""",
             output,
-            re.I
+            re.I,
         ):
             return "SQL_METACHAR"
 
     elif channel == "shell":
         if re.search(
-            r"""[;&|`<>]|\$\(|\$\{""",
-            output
+            r"[;&|`<>]|\$\(|\$\{",
+            output,
         ):
             return "SHELL_METACHAR"
 
@@ -639,54 +657,69 @@ def sanitize_output():
     body = request.get_json(silent=True)
 
     # 1. Schema
-    if (
-        not isinstance(body, dict)
-        or set(body.keys()) != {"channel", "output"}
-        or body.get("channel") not in {
-            "html",
-            "markdown",
-            "url",
-            "sql",
-            "shell"
-        }
-        or not isinstance(body.get("output"), str)
-        or len(body["output"]) > 20000
-    ):
+    if not isinstance(body, dict):
         return jsonify({
             "safe": False,
-            "reason": "INVALID_SCHEMA"
+            "reason": "INVALID_SCHEMA",
         })
 
-    channel = body["channel"]
-    output = body["output"]
+    channel = body.get("channel")
+    output = body.get("output")
 
-    # 2. Decode once and test decoded payload.
+    if channel not in {
+        "html",
+        "markdown",
+        "url",
+        "sql",
+        "shell",
+    }:
+        return jsonify({
+            "safe": False,
+            "reason": "INVALID_SCHEMA",
+        })
+
+    if not isinstance(output, str):
+        return jsonify({
+            "safe": False,
+            "reason": "INVALID_SCHEMA",
+        })
+
+    if len(output) > 20000:
+        return jsonify({
+            "safe": False,
+            "reason": "INVALID_SCHEMA",
+        })
+
+    # 2. Decode once and see if decoded version triggers
+    #    any of the channel rules.
     decoded = decode_once(output)
 
     if decoded != output:
-        if sanitize_decoded(channel, decoded) is not None:
+        decoded_reason = output_rule(channel, decoded)
+
+        if decoded_reason is not None:
             return jsonify({
                 "safe": False,
-                "reason": "ENCODED_PAYLOAD"
+                "reason": "ENCODED_PAYLOAD",
             })
 
-    # 3. Test original
-    reason = sanitize_decoded(channel, output)
+    # 3. Original output
+    reason = output_rule(channel, output)
 
-    if reason:
+    if reason is not None:
         return jsonify({
             "safe": False,
-            "reason": reason
+            "reason": reason,
         })
 
     return jsonify({
         "safe": True,
-        "reason": "SAFE"
+        "reason": "SAFE",
     })
 
 
 # ============================================================
-# QUESTION 5 — /corroborate
+# Q5 — CORROBORATE
 # ============================================================
 
 VALID_SOURCE_TYPES = {
@@ -694,17 +727,21 @@ VALID_SOURCE_TYPES = {
     "ct_log",
     "registry",
     "archive",
-    "scan"
+    "scan",
 }
 
 
-def parse_time(value):
+def parse_timestamp(value):
     if not isinstance(value, str):
         return None
 
     try:
-        value = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(value)
+        text = value
+
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(text)
 
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -719,113 +756,120 @@ def parse_time(value):
 def corroborate():
     body = request.get_json(silent=True)
 
-    # 1. Invalid
+    # Rule 1
     if not isinstance(body, dict):
         return jsonify({
             "verdict": "invalid",
             "confidence": "low",
-            "corroboratingSources": []
+            "corroboratingSources": [],
         })
 
     claim = body.get("claim")
 
-    if (
-        not isinstance(claim, dict)
-        or not isinstance(claim.get("value"), str)
-    ):
+    if not isinstance(claim, dict):
         return jsonify({
             "verdict": "invalid",
             "confidence": "low",
-            "corroboratingSources": []
+            "corroboratingSources": [],
         })
 
-    as_of = parse_time(body.get("asOf"))
+    if not isinstance(claim.get("value"), str):
+        return jsonify({
+            "verdict": "invalid",
+            "confidence": "low",
+            "corroboratingSources": [],
+        })
+
+    as_of = parse_timestamp(body.get("asOf"))
 
     if as_of is None:
         return jsonify({
             "verdict": "invalid",
             "confidence": "low",
-            "corroboratingSources": []
+            "corroboratingSources": [],
         })
 
+    staleness = body.get("stalenessDays")
+
     if (
-        not isinstance(body.get("stalenessDays"), (int, float))
-        or isinstance(body.get("stalenessDays"), bool)
+        not isinstance(staleness, (int, float))
+        or isinstance(staleness, bool)
     ):
         return jsonify({
             "verdict": "invalid",
             "confidence": "low",
-            "corroboratingSources": []
+            "corroboratingSources": [],
         })
 
-    if not isinstance(body.get("sources"), list):
+    sources = body.get("sources")
+
+    if not isinstance(sources, list):
         return jsonify({
             "verdict": "invalid",
             "confidence": "low",
-            "corroboratingSources": []
+            "corroboratingSources": [],
         })
 
     claim_value = claim["value"]
-    max_age = body["stalenessDays"] * 86400
+    max_seconds = staleness * 86400
 
-    valid_sources = []
+    fresh = []
 
-    for source in body["sources"]:
+    for source in sources:
+        # Invalid sources are ignored entirely.
         if not isinstance(source, dict):
             continue
 
-        if not (
-            isinstance(source.get("id"), str)
-            and isinstance(source.get("origin"), str)
-            and isinstance(source.get("value"), str)
-            and isinstance(source.get("observedAt"), str)
-            and source.get("type") in VALID_SOURCE_TYPES
-        ):
+        if not isinstance(source.get("id"), str):
             continue
 
-        observed = parse_time(source["observedAt"])
+        if not isinstance(source.get("origin"), str):
+            continue
+
+        if not isinstance(source.get("value"), str):
+            continue
+
+        if not isinstance(source.get("observedAt"), str):
+            continue
+
+        if source.get("type") not in VALID_SOURCE_TYPES:
+            continue
+
+        observed = parse_timestamp(source["observedAt"])
 
         if observed is None:
             continue
 
-        authoritative = source.get("authoritative", False)
-
-        if not isinstance(authoritative, bool):
-            authoritative = False
-
         age = (as_of - observed).total_seconds()
 
-        if age <= max_age:
-            valid_sources.append({
-                "id": source["id"],
-                "origin": source["origin"],
-                "value": source["value"],
-                "type": source["type"],
-                "authoritative": authoritative
-            })
+        # Fresh means <= stalenessDays.
+        if age <= max_seconds:
+            fresh.append(source)
 
-    # 2. Fresh authoritative contradiction
-    contradicting = [
-        s for s in valid_sources
-        if s["authoritative"] and s["value"] != claim_value
-    ]
+    # Rule 2: authoritative contradiction
+    contradictions = []
 
-    if contradicting:
+    for source in fresh:
+        if (
+            source.get("authoritative") is True
+            and source["value"] != claim_value
+        ):
+            contradictions.append(source["id"])
+
+    if contradictions:
         return jsonify({
             "verdict": "contradicted",
             "confidence": "low",
-            "corroboratingSources": sorted(
-                s["id"] for s in contradicting
-            )
+            "corroboratingSources": sorted(contradictions),
         })
 
-    # 3. Fresh matching sources
+    # Rule 3: matching sources
     matching = [
-        s for s in valid_sources
-        if s["value"] == claim_value
+        source
+        for source in fresh
+        if source["value"] == claim_value
     ]
 
-    # One representative per origin, smallest ID.
     representatives = {}
 
     for source in matching:
@@ -840,26 +884,29 @@ def corroborate():
     reps = list(representatives.values())
 
     if len(reps) >= 2:
-        types = {s["type"] for s in reps}
+        source_ids = sorted(source["id"] for source in reps)
+        types = {source["type"] for source in reps}
 
         return jsonify({
             "verdict": "supported",
-            "confidence": "high" if len(types) >= 2 else "medium",
-            "corroboratingSources": sorted(
-                s["id"] for s in reps
-            )
+            "confidence": (
+                "high"
+                if len(types) >= 2
+                else "medium"
+            ),
+            "corroboratingSources": source_ids,
         })
 
-    # 4. Everything else
+    # Rule 4
     return jsonify({
         "verdict": "unverified",
         "confidence": "low",
-        "corroboratingSources": []
+        "corroboratingSources": [],
     })
 
 
 # ============================================================
-# Health endpoint
+# HEALTH
 # ============================================================
 
 @app.get("/")
