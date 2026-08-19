@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 from urllib.parse import unquote, urlparse
-from html import unescape
 from datetime import datetime, timezone
 import re
 
@@ -450,7 +449,7 @@ def terraform_plan():
 
 
 # ============================================================
-# Q4 — SANITIZE OUTPUT
+# Q4 — LLM OUTPUT HANDLING GATE
 # ============================================================
 
 ALLOWED_HOSTS = {
@@ -460,33 +459,39 @@ ALLOWED_HOSTS = {
 
 
 def decode_once(value):
-    # Percent decode once.
+    """
+    Decode exactly once:
+      1. percent escapes
+      2. HTML entities
+      3. \\uXXXX escapes
+    """
+
+    # 1. Percent decoding
     s = unquote(value)
 
-    # Decode exactly the specified HTML entities.
-    entity_map = {
-        "&lt;": "<",
-        "&gt;": ">",
-        "&quot;": '"',
-        "&apos;": "'",
-        "&amp;": "&",
-    }
-
-    def entity_replace(match):
+    # 2. HTML entities
+    def decode_entity(match):
         token = match.group(0)
+        lower = token.lower()
 
-        low = token.lower()
+        named = {
+            "&lt;": "<",
+            "&gt;": ">",
+            "&quot;": '"',
+            "&apos;": "'",
+            "&amp;": "&",
+        }
 
-        if low in entity_map:
-            return entity_map[low]
+        if lower in named:
+            return named[lower]
 
-        if low.startswith("&#x"):
+        if lower.startswith("&#x"):
             try:
                 return chr(int(token[3:-1], 16))
             except ValueError:
                 return token
 
-        if low.startswith("&#"):
+        if lower.startswith("&#"):
             try:
                 return chr(int(token[2:-1], 10))
             except ValueError:
@@ -496,12 +501,12 @@ def decode_once(value):
 
     s = re.sub(
         r"&(?:lt|gt|quot|apos|amp);|&#[0-9]+;|&#x[0-9a-fA-F]+;",
-        entity_replace,
+        decode_entity,
         s,
-        flags=re.I,
+        flags=re.IGNORECASE,
     )
 
-    # Decode \uXXXX once.
+    # 3. Unicode escapes
     s = re.sub(
         r"\\u([0-9a-fA-F]{4})",
         lambda m: chr(int(m.group(1), 16)),
@@ -512,137 +517,186 @@ def decode_once(value):
 
 
 def extract_html_urls(text):
-    return [
-        m.group(2)
-        for m in re.finditer(
-            r"""\b(?:src|href)\s*=\s*(["'])(.*?)\1""",
-            text,
-            re.I | re.S,
-        )
-    ]
+    """
+    Extract quoted src= and href= attribute values.
+    """
+
+    urls = []
+
+    pattern = re.compile(
+        r"""(?:src|href)\s*=\s*(["'])(.*?)\1""",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in pattern.finditer(text):
+        urls.append(match.group(2))
+
+    return urls
 
 
 def extract_markdown_urls(text):
-    results = []
+    """
+    Extract the target inside ](...).
+    """
 
-    for m in re.finditer(r"\]\(\s*([^)]+?)\s*\)", text):
-        target = m.group(1).strip()
+    urls = []
 
-        if target.startswith("<") and target.endswith(">"):
-            target = target[1:-1]
+    pattern = re.compile(
+        r"""\]\(\s*(.*?)\s*\)""",
+        re.DOTALL,
+    )
 
-        # Markdown destination may contain an optional title.
-        # The URL is the first token unless enclosed in <...>.
-        if not target.startswith("<"):
+    for match in pattern.finditer(text):
+        target = match.group(1).strip()
+
+        # <https://example.com/path>
+        if target.startswith("<"):
+            closing = target.find(">")
+            if closing != -1:
+                target = target[1:closing]
+        else:
+            # URL followed by an optional markdown title.
             target = target.split(None, 1)[0]
 
-        results.append(target)
+        urls.append(target)
 
-    return results
+    return urls
 
 
-def has_dangerous_scheme(text, urls):
-    # Explicit dangerous schemes anywhere in the text.
+def dangerous_scheme(text, urls):
+    """
+    DANGEROUS_SCHEME:
+      javascript:
+      data:
+      vbscript:
+      or an extracted URL with a scheme other than http/https.
+    """
+
     if re.search(
         r"(?:javascript|data|vbscript)\s*:",
         text,
-        re.I,
+        re.IGNORECASE,
     ):
         return True
 
-    for url in urls:
-        candidate = (
-            "https:" + url
-            if url.startswith("//")
-            else url
-        )
+    for raw_url in urls:
+        url = raw_url.strip()
 
-        parsed = urlparse(candidate)
+        if url.startswith("//"):
+            parsed = urlparse("https:" + url)
+        else:
+            parsed = urlparse(url)
 
-        if parsed.scheme and parsed.scheme.lower() not in {
-            "http",
-            "https",
-        }:
-            return True
-
-    return False
-
-
-def has_external_exfil(urls):
-    for url in urls:
-        url = url.strip()
-
-        # Relative references are allowed.
-        if url.startswith("/") and not url.startswith("//"):
-            continue
-
-        # Protocol-relative is absolute and resolved as HTTPS.
-        candidate = (
-            "https:" + url
-            if url.startswith("//")
-            else url
-        )
-
-        parsed = urlparse(candidate)
-
-        if parsed.scheme.lower() in {"http", "https"}:
-            if parsed.hostname not in ALLOWED_HOSTS:
+        if parsed.scheme:
+            if parsed.scheme.lower() not in {"http", "https"}:
                 return True
 
     return False
 
 
-def output_rule(channel, output):
+def external_exfil(urls):
+    """
+    Exact hostname matching.
+
+    Relative /local/page is allowed.
+    //host/path is absolute and resolved as https.
+    """
+
+    for raw_url in urls:
+        url = raw_url.strip()
+
+        # Relative reference
+        if url.startswith("/") and not url.startswith("//"):
+            continue
+
+        # Protocol-relative reference
+        if url.startswith("//"):
+            parsed = urlparse("https:" + url)
+        else:
+            parsed = urlparse(url)
+
+        if parsed.scheme.lower() not in {"http", "https"}:
+            continue
+
+        # Compare parsed hostname only.
+        hostname = parsed.hostname
+
+        if hostname not in ALLOWED_HOSTS:
+            return True
+
+    return False
+
+
+def q4_rule(channel, output):
+
+    # HTML
     if channel == "html":
+
+        # SCRIPT_TAG
         if re.search(
-            r"<\s*(script|iframe|object|embed)\b",
+            r"<\s*(?:script|iframe|object|embed)\b",
             output,
-            re.I,
+            re.IGNORECASE,
         ):
             return "SCRIPT_TAG"
 
+        # EVENT_HANDLER
         if re.search(
             r"\bon[a-zA-Z][a-zA-Z0-9_-]*\s*=",
             output,
-            re.I,
+            re.IGNORECASE,
         ):
             return "EVENT_HANDLER"
 
         urls = extract_html_urls(output)
 
-        if has_dangerous_scheme(output, urls):
+        # DANGEROUS_SCHEME
+        if dangerous_scheme(output, urls):
             return "DANGEROUS_SCHEME"
 
-        if has_external_exfil(urls):
+        # EXTERNAL_EXFIL
+        if external_exfil(urls):
             return "EXTERNAL_EXFIL"
 
+    # Markdown
     elif channel == "markdown":
+
         urls = extract_markdown_urls(output)
 
-        if has_dangerous_scheme(output, urls):
+        # DANGEROUS_SCHEME
+        if dangerous_scheme(output, urls):
             return "DANGEROUS_SCHEME"
 
-        if has_external_exfil(urls):
+        # EXTERNAL_EXFIL
+        if external_exfil(urls):
             return "EXTERNAL_EXFIL"
 
+    # URL
     elif channel == "url":
+
         urls = [output.strip()]
 
-        if has_dangerous_scheme(output, urls):
+        # DANGEROUS_SCHEME
+        if dangerous_scheme(output, urls):
             return "DANGEROUS_SCHEME"
 
-        if has_external_exfil(urls):
+        # EXTERNAL_EXFIL
+        if external_exfil(urls):
             return "EXTERNAL_EXFIL"
 
+    # SQL
     elif channel == "sql":
+
         if re.search(
-            r"""['";]|--|/\*|\bunion\b|\bor\s+1=1\b""",
+            r"""['";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b""",
             output,
-            re.I,
+            re.IGNORECASE,
         ):
             return "SQL_METACHAR"
 
+    # Shell
     elif channel == "shell":
+
         if re.search(
             r"[;&|`<>]|\$\(|\$\{",
             output,
@@ -654,13 +708,17 @@ def output_rule(channel, output):
 
 @app.post("/sanitize-output")
 def sanitize_output():
+
+    # ========================================================
+    # 1. INVALID_SCHEMA
+    # ========================================================
+
     body = request.get_json(silent=True)
 
-    # 1. Schema
     if not isinstance(body, dict):
         return jsonify({
             "safe": False,
-            "reason": "INVALID_SCHEMA",
+            "reason": "INVALID_SCHEMA"
         })
 
     channel = body.get("channel")
@@ -675,51 +733,63 @@ def sanitize_output():
     }:
         return jsonify({
             "safe": False,
-            "reason": "INVALID_SCHEMA",
+            "reason": "INVALID_SCHEMA"
         })
 
     if not isinstance(output, str):
         return jsonify({
             "safe": False,
-            "reason": "INVALID_SCHEMA",
+            "reason": "INVALID_SCHEMA"
         })
 
     if len(output) > 20000:
         return jsonify({
             "safe": False,
-            "reason": "INVALID_SCHEMA",
+            "reason": "INVALID_SCHEMA"
         })
 
-    # 2. Decode once and see if decoded version triggers
-    #    any of the channel rules.
+    # ========================================================
+    # 2. ENCODED_PAYLOAD
+    # ========================================================
+
     decoded = decode_once(output)
 
     if decoded != output:
-        decoded_reason = output_rule(channel, decoded)
 
-        if decoded_reason is not None:
+        decoded_violation = q4_rule(
+            channel,
+            decoded
+        )
+
+        if decoded_violation is not None:
             return jsonify({
                 "safe": False,
-                "reason": "ENCODED_PAYLOAD",
+                "reason": "ENCODED_PAYLOAD"
             })
 
-    # 3. Original output
-    reason = output_rule(channel, output)
+    # ========================================================
+    # 3. ORIGINAL OUTPUT
+    # ========================================================
 
-    if reason is not None:
+    violation = q4_rule(
+        channel,
+        output
+    )
+
+    if violation is not None:
         return jsonify({
             "safe": False,
-            "reason": reason,
+            "reason": violation
         })
 
     return jsonify({
         "safe": True,
-        "reason": "SAFE",
+        "reason": "SAFE"
     })
 
 
 # ============================================================
-# Q5 — CORROBORATE
+# Q5 — OSINT CORROBORATION
 # ============================================================
 
 VALID_SOURCE_TYPES = {
@@ -729,6 +799,8 @@ VALID_SOURCE_TYPES = {
     "archive",
     "scan",
 }
+
+TF_ENVIRONMENT_UNUSED = "prod-4tx5cu"
 
 
 def parse_timestamp(value):
@@ -754,9 +826,10 @@ def parse_timestamp(value):
 
 @app.post("/corroborate")
 def corroborate():
-    body = request.get_json(silent=True)
 
     # Rule 1
+    body = request.get_json(silent=True)
+
     if not isinstance(body, dict):
         return jsonify({
             "verdict": "invalid",
@@ -816,6 +889,7 @@ def corroborate():
     fresh = []
 
     for source in sources:
+
         # Invalid sources are ignored entirely.
         if not isinstance(source, dict):
             continue
@@ -842,11 +916,10 @@ def corroborate():
 
         age = (as_of - observed).total_seconds()
 
-        # Fresh means <= stalenessDays.
         if age <= max_seconds:
             fresh.append(source)
 
-    # Rule 2: authoritative contradiction
+    # Rule 2 — authoritative contradiction
     contradictions = []
 
     for source in fresh:
@@ -863,7 +936,7 @@ def corroborate():
             "corroboratingSources": sorted(contradictions),
         })
 
-    # Rule 3: matching sources
+    # Rule 3 — matching fresh sources
     matching = [
         source
         for source in fresh
@@ -884,8 +957,16 @@ def corroborate():
     reps = list(representatives.values())
 
     if len(reps) >= 2:
-        source_ids = sorted(source["id"] for source in reps)
-        types = {source["type"] for source in reps}
+
+        source_ids = sorted(
+            source["id"]
+            for source in reps
+        )
+
+        types = {
+            source["type"]
+            for source in reps
+        }
 
         return jsonify({
             "verdict": "supported",
@@ -906,13 +987,18 @@ def corroborate():
 
 
 # ============================================================
-# HEALTH
+# HEALTH CHECK
 # ============================================================
 
 @app.get("/")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok"
+    })
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(
+        host="0.0.0.0",
+        port=8080
+    )
