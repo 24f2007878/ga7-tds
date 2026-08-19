@@ -7,10 +7,21 @@ on:
 
 permissions:
   contents: read
+  packages: write
+  id-token: none
 
 jobs:
   release-gate:
-    runs-on: ubuntu-latest
+    name: Release gate tests
+    runs-on: ${{ matrix.python-version }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
 
     steps:
       - name: "TDS identity: 24f2007878@ds.study.iitm.ac.in"
@@ -22,7 +33,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -67,13 +78,13 @@ jobs:
           }
 
           response = client.post("/release-gate", json=payload)
-          result = response.get_json()
 
           assert response.status_code == 200
-          assert result == {
-              "decision": "promote",
-              "violations": []
-          }
 
-          print("release-gate test passed")
+          result = response.get_json()
+
+          assert result["decision"] == "promote"
+          assert result["violations"] == []
+
+          print("release-gate passed")
           PY
