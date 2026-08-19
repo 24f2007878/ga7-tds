@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: TDS identity: 24f2007878@ds.study.iitm.ac.in
+      - name: "TDS identity: 24f2007878@ds.study.iitm.ac.in"
         run: echo "TDS identity verified"
 
       - name: Checkout
